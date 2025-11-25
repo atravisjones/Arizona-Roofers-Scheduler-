@@ -200,7 +200,6 @@ export const useAppLogic = () => {
 
   const handleRedo = useCallback(() => {
     if (canRedo) {
-        // FIX: Redo should increment the history index, not decrement it.
         setHistoryIndex(prev => prev + 1);
         log('ACTION: Redo');
         setActiveRoute(null);
@@ -1232,7 +1231,6 @@ export const useAppLogic = () => {
     }, 'Toggle Rep Lock');
   }, [recordChange, selectedDate]);
 
-  // FIX: Allow `originalTimeframe` to be updated to support reschedule confirmation.
   const handleUpdateJob = useCallback((jobId: string, updatedDetails: Partial<Pick<Job, 'customerName' | 'address' | 'notes' | 'originalTimeframe'>>) => { 
     const dateKey = formatDateToKey(selectedDate);
     recordChange(currentDailyStates => {
@@ -1514,82 +1512,76 @@ export const useAppLogic = () => {
         let jobsToOptimize = targetRep.schedule.flatMap(s => s.jobs);
         const jobCount = jobsToOptimize.length;
 
-        // 1. Determine Drive Time Buffer based on job count
-        let driveBufferMinutes = 30;
-        if (jobCount === 4) driveBufferMinutes = 60;
-        if (jobCount <= 3) driveBufferMinutes = 90;
+        // Conditional optimization logic based on job count
+        if (jobCount >= 5) {
+            // Full optimization for 5+ jobs
+            const sortedJobs = [...jobsToOptimize].sort((a, b) => getSortableHour(a.originalTimeframe) - getSortableHour(b.originalTimeframe));
+            targetRep.schedule.forEach(s => s.jobs = []);
 
-        // 2. Bucket jobs by Original Timeframe
-        const buckets: Record<number, DisplayJob[]> = {};
-        jobsToOptimize.forEach(job => {
-            const h = getSortableHour(job.originalTimeframe);
-            if (!buckets[h]) buckets[h] = [];
-            buckets[h].push(job);
-        });
+            let slotIndex = 0;
+            const maxJobsInSlot = dayState.settings.allowDoubleBooking ? dayState.settings.maxJobsPerSlot : 1;
 
-        const sortedHours = Object.keys(buckets).map(Number).sort((a, b) => a - b);
-        const finalSortedJobs: DisplayJob[] = [];
-        
-        // Set initial reference point (Home Base)
-        let currentReferenceCoord: Coordinates | undefined;
-        if (targetRep.zipCodes?.[0]) {
-             const homeKey = `${targetRep.zipCodes[0]}, Arizona, USA`;
-             currentReferenceCoord = tempCoordMap.get(homeKey);
-        }
-
-        // 3. Nearest Neighbor Sort within each time bucket
-        for (const h of sortedHours) {
-            let unvisited = [...buckets[h]];
-            
-            while (unvisited.length > 0) {
-                let nearestIndex = 0; // Default to first if no coordinates available
-                let minDist = Infinity;
-
-                if (currentReferenceCoord) {
-                    // Find nearest job in this bucket to the current reference
-                    unvisited.forEach((job, idx) => {
-                        const coord = tempCoordMap.get(job.address);
-                        if (coord) {
-                            const dist = haversineDistance(currentReferenceCoord!, coord);
-                            if (dist < minDist) {
-                                minDist = dist;
-                                nearestIndex = idx;
-                            }
-                        }
-                    });
+            for (const job of sortedJobs) {
+                while (slotIndex < TIME_SLOTS.length) {
+                    const currentSlot = targetRep.schedule[slotIndex];
+                    if (currentSlot.jobs.length < maxJobsInSlot) {
+                        currentSlot.jobs.push({ ...job, timeSlotLabel: currentSlot.label });
+                        break;
+                    }
+                    slotIndex++;
                 }
-                
-                const [nextJob] = unvisited.splice(nearestIndex, 1);
-                finalSortedJobs.push(nextJob);
-                
-                // Update reference for next iteration
-                const nextCoord = tempCoordMap.get(nextJob.address);
-                if (nextCoord) currentReferenceCoord = nextCoord;
+                if (slotIndex >= TIME_SLOTS.length) {
+                    newState.unassignedJobs.push(job);
+                }
             }
+            targetRep.isOptimized = true;
+
+        } else {
+             // Reorder within existing slots for 4 or fewer jobs
+            targetRep.schedule.forEach(slot => {
+                if (slot.jobs.length > 1) {
+                    let sortedSlotJobs: DisplayJob[] = [];
+                    let unvisited = [...slot.jobs];
+                    
+                    let currentReferenceCoord: Coordinates | undefined;
+                    // Try to find a starting point (e.g., closest to home or previous slot)
+                    // For simplicity, we'll start with the first geocodable job
+                    let startIndex = unvisited.findIndex(job => tempCoordMap.has(job.address));
+                    if (startIndex === -1) startIndex = 0; // Fallback
+                    
+                    let [currentJob] = unvisited.splice(startIndex, 1);
+                    sortedSlotJobs.push(currentJob);
+                    currentReferenceCoord = tempCoordMap.get(currentJob.address);
+
+                    while(unvisited.length > 0) {
+                        if (!currentReferenceCoord) {
+                            sortedSlotJobs.push(...unvisited);
+                            break;
+                        }
+                        let nearestIndex = 0;
+                        let minDist = Infinity;
+                        unvisited.forEach((job, idx) => {
+                            const coord = tempCoordMap.get(job.address);
+                            if (coord) {
+                                const dist = haversineDistance(currentReferenceCoord!, coord);
+                                if (dist < minDist) {
+                                    minDist = dist;
+                                    nearestIndex = idx;
+                                }
+                            }
+                        });
+                        
+                        [currentJob] = unvisited.splice(nearestIndex, 1);
+                        sortedSlotJobs.push(currentJob);
+                        currentReferenceCoord = tempCoordMap.get(currentJob.address);
+                    }
+                    slot.jobs = sortedSlotJobs.map(j => ({ ...j, timeSlotLabel: slot.label }));
+                } else if (slot.jobs.length === 1) {
+                    slot.jobs[0].timeSlotLabel = slot.label;
+                }
+            });
+            targetRep.isOptimized = true;
         }
-        
-        // 4. Assign Times using dynamic buffer
-        let currentTime = new Date();
-        currentTime.setHours(7, 30, 0, 0); 
-        // Lunch logic REMOVED
-        
-        finalSortedJobs.forEach((job, idx) => {
-            // Job Start
-            const startStr = currentTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase().replace(/\s/g, '');
-            
-            // Job Duration (90 mins)
-            currentTime.setMinutes(currentTime.getMinutes() + 90);
-            const endStr = currentTime.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit' }).toLowerCase().replace(/\s/g, '');
-            
-            job.timeSlotLabel = `${startStr}-${endStr}`;
-
-            // Add Drive Time Buffer (Dynamic)
-            currentTime.setMinutes(currentTime.getMinutes() + driveBufferMinutes);
-        });
-
-        targetRep.schedule.forEach(s => s.jobs = []);
-        targetRep.schedule[0].jobs = finalSortedJobs;
-        targetRep.isOptimized = true;
 
         newDailyStates.set(dateKey, newState);
         return newDailyStates;

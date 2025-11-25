@@ -1,0 +1,5 @@
+{
+  "name": "Arizona Roofers Rep Scheduler",
+  "description": "An application to visualize sales representative availability from Google Sheets, assign jobs via pasted text, and plot optimized routes on Google Maps.",
+  "requestFramePermissions": []
+}
